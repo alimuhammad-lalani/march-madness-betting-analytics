@@ -1,0 +1,632 @@
+---
+title: "March Madness Win Probability & Bet Sizing"
+author: "Ali Lalani, Steve Elengical, Weihao Huang"
+date: "Spring 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+# Project Overview
+
+This project develops a statistical framework for estimating NCAA March Madness game win probabilities and translating those probabilities into risk-aware betting decisions.
+
+The workflow is:
+
+1. Pair historical tournament teams into game-level observations.
+2. Convert team statistics into matchup differences (Team A minus Team B).
+3. Separate historical data into chronological training and test sets.
+4. Use LASSO logistic regression for feature selection.
+5. Evaluate the selected feature set with multivariate analysis.
+6. Fit an interpretable logistic regression model.
+7. Evaluate out-of-sample predictive performance.
+8. Generate probabilities for supplied 2026 matchups.
+9. Use the Kelly Criterion when sportsbook odds are available.
+
+> **Important:** Sportsbook odds are not included in the current project folder. The betting section therefore provides a reproducible Kelly Criterion implementation but does not claim validated real-world betting returns without an odds dataset.
+
+# 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(dplyr)
+library(stringr)
+library(glmnet)
+library(corrplot)
+library(MVN)
+
+set.seed(6359)
+```
+
+This analysis uses relative file paths so that the project can be cloned and run on another computer.
+
+Expected repository structure:
+
+```text
+data/
+  KenPom_Barttorvik.csv
+  Tournament_Matchups.csv
+```
+
+# 2. Load Data
+
+```{r load-data}
+kenpom <- read.csv(
+  "data/KenPom_Barttorvik.csv",
+  check.names = TRUE
+)
+
+matchups_raw <- read.csv(
+  "data/Tournament_Matchups.csv",
+  check.names = TRUE
+)
+
+dim(kenpom)
+dim(matchups_raw)
+```
+
+`make.names()`-compatible column names are used so variables containing spaces and `%` symbols can be referenced safely in R.
+
+```{r inspect-data}
+head(kenpom)
+head(matchups_raw)
+```
+
+# 3. Construct Matchup-Level Data
+
+The tournament matchup file stores each game as two consecutive team rows. We first verify that the file contains an even number of rows, assign a game identifier, and convert each pair into a single matchup.
+
+```{r pair-matchups}
+if (nrow(matchups_raw) %% 2 != 0) {
+  stop("Tournament matchup data must contain an even number of rows.")
+}
+
+paired_raw <- matchups_raw %>%
+  mutate(
+    SourceRow = row_number(),
+    GameID = ceiling(row_number() / 2)
+  )
+
+team_A <- paired_raw %>%
+  group_by(GameID) %>%
+  slice(1) %>%
+  ungroup() %>%
+  transmute(
+    GameID,
+    YEAR,
+    CURRENT_ROUND = CURRENT.ROUND,
+    Team_A = TEAM,
+    Seed_A = SEED,
+    Score_A = SCORE
+  )
+
+team_B <- paired_raw %>%
+  group_by(GameID) %>%
+  slice(2) %>%
+  ungroup() %>%
+  transmute(
+    GameID,
+    YEAR_B = YEAR,
+    CURRENT_ROUND_B = CURRENT.ROUND,
+    Team_B = TEAM,
+    Seed_B = SEED,
+    Score_B = SCORE
+  )
+
+games <- team_A %>%
+  inner_join(team_B, by = "GameID")
+
+# Verify that each consecutive row pair represents the same season and round.
+stopifnot(all(games$YEAR == games$YEAR_B))
+stopifnot(all(games$CURRENT_ROUND == games$CURRENT_ROUND_B))
+
+games <- games %>%
+  mutate(
+    Team_A_Win = case_when(
+      !is.na(Score_A) & !is.na(Score_B) & Score_A > Score_B ~ 1,
+      !is.na(Score_A) & !is.na(Score_B) & Score_A < Score_B ~ 0,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  select(
+    GameID, YEAR, CURRENT_ROUND,
+    Team_A, Team_B, Seed_A, Seed_B,
+    Score_A, Score_B, Team_A_Win
+  )
+
+table(games$YEAR, useNA = "ifany")
+```
+
+## Prevent Team-Order Bias
+
+If one side of the raw data is systematically listed first, the model could learn row ordering instead of basketball strength. Historical games are therefore randomly swapped for approximately half of the observations.
+
+The 2026 unlabeled matchups are left in their original orientation so their reported probabilities correspond directly to the supplied Team A / Team B ordering.
+
+```{r randomize-team-order}
+historical_games <- games %>%
+  filter(!is.na(Team_A_Win))
+
+future_games <- games %>%
+  filter(is.na(Team_A_Win))
+
+swap_idx <- sample(
+  seq_len(nrow(historical_games)),
+  size = floor(nrow(historical_games) / 2)
+)
+
+historical_randomized <- historical_games
+
+historical_randomized$Team_A[swap_idx] <- historical_games$Team_B[swap_idx]
+historical_randomized$Team_B[swap_idx] <- historical_games$Team_A[swap_idx]
+
+historical_randomized$Seed_A[swap_idx] <- historical_games$Seed_B[swap_idx]
+historical_randomized$Seed_B[swap_idx] <- historical_games$Seed_A[swap_idx]
+
+historical_randomized$Score_A[swap_idx] <- historical_games$Score_B[swap_idx]
+historical_randomized$Score_B[swap_idx] <- historical_games$Score_A[swap_idx]
+
+historical_randomized$Team_A_Win[swap_idx] <-
+  1 - historical_games$Team_A_Win[swap_idx]
+
+all_games <- bind_rows(
+  historical_randomized,
+  future_games
+) %>%
+  arrange(desc(YEAR), GameID)
+
+mean(historical_randomized$Team_A_Win)
+```
+
+The historical target should now be approximately balanced between Team A wins and losses.
+
+# 4. Join Team Statistics
+
+KenPom/BartTorvik statistics are joined once for Team A and once for Team B using season and team name.
+
+```{r join-statistics}
+matchups_with_stats <- all_games %>%
+  left_join(
+    kenpom,
+    by = c("YEAR" = "YEAR", "Team_A" = "TEAM")
+  ) %>%
+  left_join(
+    kenpom,
+    by = c("YEAR" = "YEAR", "Team_B" = "TEAM"),
+    suffix = c("_A", "_B")
+  )
+```
+
+# 5. Matchup Feature Engineering
+
+For each numeric statistic available for both teams, we calculate:
+
+\[
+\text{Difference} = \text{Team A statistic} - \text{Team B statistic}
+\]
+
+Positive values therefore indicate that Team A has a larger value for that metric.
+
+```{r calculate-differences}
+# Only generate differences from variables that originate in the
+# KenPom/BartTorvik table. This prevents matchup fields such as final
+# game scores from accidentally becoming predictors.
+stat_names <- names(kenpom) %>%
+  setdiff(c("YEAR", "TEAM"))
+
+model_data <- matchups_with_stats
+
+for (stat in stat_names) {
+  col_a <- paste0(stat, "_A")
+  col_b <- paste0(stat, "_B")
+  diff_name <- paste0("Diff_", stat)
+
+  if (
+    col_a %in% names(model_data) &&
+    col_b %in% names(model_data) &&
+    is.numeric(model_data[[col_a]]) &&
+    is.numeric(model_data[[col_b]])
+  ) {
+    model_data[[diff_name]] <- model_data[[col_a]] - model_data[[col_b]]
+  }
+}
+```
+
+## Remove Leakage and Identifier Variables
+
+Variables that encode tournament advancement, final win/loss totals, ranks, identifiers, or other post-outcome information are not used as predictors.
+
+```{r remove-leakage}
+model_data <- model_data %>%
+  select(
+    GameID,
+    YEAR,
+    CURRENT_ROUND,
+    Team_A,
+    Team_B,
+    Team_A_Win,
+    starts_with("Diff_")
+  ) %>%
+  select(
+    -any_of(c(
+      "Diff_ROUND",
+      "Diff_GAMES",
+      "Diff_W",
+      "Diff_L",
+      "Diff_WIN.",
+      "Diff_QUAD.NO",
+      "Diff_QUAD.ID",
+      "Diff_TEAM.NO",
+      "Diff_TEAM.ID"
+    )),
+    -contains(".RANK"),
+    -contains("CONF")
+  )
+
+historical_model_data <- model_data %>%
+  filter(!is.na(Team_A_Win)) %>%
+  tidyr::drop_na()
+
+prediction_2026 <- model_data %>%
+  filter(YEAR == 2026) %>%
+  filter(if_all(starts_with("Diff_"), ~ !is.na(.)))
+
+dim(historical_model_data)
+dim(prediction_2026)
+```
+
+# 6. Chronological Train/Test Split
+
+A random game-level split can allow later seasons to influence a model that is evaluated on earlier seasons. To better approximate prospective prediction, this version uses a chronological holdout.
+
+- **Training:** 2008–2022
+- **Testing:** 2023–2025
+- **Prediction:** supplied 2026 matchup rows
+
+```{r train-test-split}
+training <- historical_model_data %>%
+  filter(YEAR <= 2022)
+
+testing <- historical_model_data %>%
+  filter(YEAR >= 2023, YEAR <= 2025)
+
+c(
+  training_games = nrow(training),
+  testing_games = nrow(testing)
+)
+```
+
+# 7. Exploratory Correlation Analysis
+
+The original dataset contains many strongly related basketball metrics. We examine correlations using the training data only.
+
+```{r correlation-analysis, fig.width=10, fig.height=8}
+train_predictors <- training %>%
+  select(starts_with("Diff_"))
+
+cor_matrix <- cor(
+  train_predictors,
+  use = "pairwise.complete.obs"
+)
+
+corrplot(
+  cor_matrix,
+  method = "color",
+  type = "upper",
+  order = "hclust",
+  tl.cex = 0.45
+)
+```
+
+Count unique pairs with absolute correlation greater than 0.70:
+
+```{r strong-correlations}
+cor_indices <- which(
+  abs(cor_matrix) > 0.70 & upper.tri(cor_matrix),
+  arr.ind = TRUE
+)
+
+strong_correlations <- data.frame(
+  Variable_1 = rownames(cor_matrix)[cor_indices[, 1]],
+  Variable_2 = colnames(cor_matrix)[cor_indices[, 2]],
+  Correlation = cor_matrix[cor_indices]
+) %>%
+  arrange(desc(abs(Correlation)))
+
+nrow(strong_correlations)
+head(strong_correlations, 20)
+```
+
+# 8. LASSO Feature Selection
+
+Feature selection is performed **only on the training data**. This prevents the test seasons from influencing which predictors are chosen.
+
+```{r lasso-feature-selection, fig.width=8, fig.height=6}
+x_train <- as.matrix(
+  training %>%
+    select(starts_with("Diff_"))
+)
+
+y_train <- training$Team_A_Win
+
+set.seed(6359)
+
+lasso_cv <- cv.glmnet(
+  x = x_train,
+  y = y_train,
+  family = "binomial",
+  alpha = 1,
+  nfolds = 10
+)
+
+plot(lasso_cv)
+
+lasso_coef <- coef(lasso_cv, s = "lambda.min")
+
+selected_features <- rownames(lasso_coef)[
+  as.vector(lasso_coef != 0)
+]
+
+selected_features <- setdiff(
+  selected_features,
+  "(Intercept)"
+)
+
+selected_features
+```
+
+For transparency, display the non-zero LASSO coefficients:
+
+```{r lasso-coefficients}
+selected_coefs <- data.frame(
+  Feature = rownames(lasso_coef),
+  Coefficient = as.numeric(lasso_coef)
+) %>%
+  filter(Feature != "(Intercept)", Coefficient != 0) %>%
+  arrange(desc(abs(Coefficient)))
+
+selected_coefs
+```
+
+> The cleaned workflow intentionally re-runs LASSO after the chronological split. Therefore, the selected features may differ somewhat from the seven predictors reported in the original class report. The GitHub results should reflect this leakage-free rerun rather than hard-coding the earlier feature list.
+
+# 9. Multivariate Analysis of Selected Features
+
+The selected features can be examined jointly to assess whether their multivariate profiles differ between winning and losing teams.
+
+## Multivariate Normality
+
+```{r multivariate-normality}
+selected_training <- training %>%
+  select(all_of(selected_features))
+
+mvn_result <- mvn(
+  data = selected_training
+)
+
+mvn_result
+```
+
+Multivariate normality results should be interpreted as a diagnostic rather than as proof that MANOVA assumptions are perfectly satisfied.
+
+## MANOVA
+
+```{r manova}
+Y <- as.matrix(
+  training %>%
+    select(all_of(selected_features))
+)
+
+manova_data <- training %>%
+  mutate(Win_Group = factor(Team_A_Win))
+
+manova_model <- manova(
+  Y ~ Win_Group,
+  data = manova_data
+)
+
+summary(
+  manova_model,
+  test = "Pillai"
+)
+```
+
+A statistically significant Pillai's Trace would indicate that the selected metrics collectively differ between games won and lost by Team A.
+
+# 10. Logistic Regression
+
+The final interpretable model uses the predictors selected by LASSO.
+
+```{r fit-logistic-model}
+final_formula <- reformulate(
+  selected_features,
+  response = "Team_A_Win"
+)
+
+final_model <- glm(
+  final_formula,
+  data = training,
+  family = binomial()
+)
+
+summary(final_model)
+```
+
+# 11. Out-of-Sample Model Evaluation
+
+The model is evaluated only on the held-out 2023–2025 games.
+
+```{r evaluate-model}
+test_probability <- predict(
+  final_model,
+  newdata = testing,
+  type = "response"
+)
+
+test_prediction <- ifelse(
+  test_probability >= 0.50,
+  1,
+  0
+)
+
+confusion_matrix <- table(
+  Actual = testing$Team_A_Win,
+  Predicted = test_prediction
+)
+
+confusion_matrix
+
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+
+sensitivity <- confusion_matrix["1", "1"] /
+  sum(confusion_matrix["1", ])
+
+specificity <- confusion_matrix["0", "0"] /
+  sum(confusion_matrix["0", ])
+
+metrics <- data.frame(
+  Metric = c("Accuracy", "Sensitivity", "Specificity"),
+  Value = c(accuracy, sensitivity, specificity)
+)
+
+metrics
+```
+
+This code calculates evaluation metrics directly from the confusion matrix rather than hard-coding cell counts.
+
+## Model Diagnostics
+
+```{r model-diagnostics, fig.width=8, fig.height=8}
+par(mfrow = c(2, 2))
+plot(final_model)
+par(mfrow = c(1, 1))
+```
+
+For logistic regression, residual normality is not a model requirement. Diagnostic plots are used primarily to identify unusual residual structure, influential observations, and potential model misspecification.
+
+# 12. Supplied 2026 Matchup Probabilities
+
+The supplied matchup file contains multiple 2026 placeholder rows across several tournament stages. This section generates probabilities for those supplied pairings without assuming that every listed future pairing will actually occur.
+
+```{r predict-2026}
+prediction_2026$Team_A_Probability <- predict(
+  final_model,
+  newdata = prediction_2026,
+  type = "response"
+)
+
+prediction_2026$Team_B_Probability <-
+  1 - prediction_2026$Team_A_Probability
+
+prediction_2026$Predicted_Winner <- ifelse(
+  prediction_2026$Team_A_Probability >= 0.50,
+  prediction_2026$Team_A,
+  prediction_2026$Team_B
+)
+
+prediction_table <- prediction_2026 %>%
+  select(
+    YEAR,
+    CURRENT_ROUND,
+    Team_A,
+    Team_B,
+    Team_A_Probability,
+    Team_B_Probability,
+    Predicted_Winner
+  ) %>%
+  arrange(desc(CURRENT_ROUND))
+
+head(prediction_table, 20)
+```
+
+# 13. Kelly Criterion
+
+The Kelly Criterion determines the bankroll fraction to wager when the model probability exceeds the break-even probability implied by the offered odds.
+
+For decimal odds \(d\):
+
+\[
+b = d - 1
+\]
+
+\[
+f^* = \frac{bp - (1-p)}{b}
+\]
+
+where:
+
+- \(p\) = estimated probability of winning
+- \(b\) = net profit per dollar wagered
+- \(f^*\) = recommended fraction of bankroll
+
+Negative Kelly fractions indicate that no wager should be placed.
+
+```{r kelly-function}
+kelly_fraction <- function(probability, decimal_odds) {
+  if (
+    probability <= 0 ||
+    probability >= 1 ||
+    decimal_odds <= 1
+  ) {
+    stop("Probability must be between 0 and 1 and decimal odds must exceed 1.")
+  }
+
+  b <- decimal_odds - 1
+  q <- 1 - probability
+
+  raw_kelly <- (b * probability - q) / b
+
+  max(0, raw_kelly)
+}
+
+# Example corresponding to approximately -400 American odds:
+kelly_fraction(
+  probability = 0.92,
+  decimal_odds = 1.25
+)
+```
+
+A fractional Kelly strategy can reduce bankroll volatility:
+
+```{r fractional-kelly}
+full_kelly <- kelly_fraction(
+  probability = 0.92,
+  decimal_odds = 1.25
+)
+
+half_kelly <- 0.5 * full_kelly
+
+c(
+  Full_Kelly = full_kelly,
+  Half_Kelly = half_kelly
+)
+```
+
+## Optional Sportsbook Odds Integration
+
+If a future file named `data/sportsbook_odds.csv` is added with matchup-specific sportsbook odds, it can be merged with the model probabilities and used to calculate actual betting recommendations.
+
+A public GitHub version should distinguish clearly between:
+
+- model-estimated win probabilities,
+- sportsbook-implied probabilities,
+- hypothetical/simulated odds, and
+- historically observed sportsbook prices.
+
+# 14. Limitations
+
+This analysis has several important limitations:
+
+1. The model relies on historical team-level performance metrics and does not explicitly include injuries, lineup changes, player availability, or game-specific context.
+2. The current project folder does not contain a verified historical sportsbook-odds dataset, so real-world betting profitability cannot be validated from the available files alone.
+3. The supplied 2026 file contains placeholder matchups across multiple stages; later-round predictions should not be interpreted as a fully simulated bracket unless bracket advancement logic is added.
+4. Basketball metrics should ideally represent information available before each game. If any source metrics were calculated using games occurring after the prediction date, that would introduce look-ahead bias and should be addressed in a future version.
+
+# 15. Conclusion
+
+This project combines matchup-level feature engineering, regularized feature selection, multivariate statistics, logistic regression, and risk-based decision-making to estimate NCAA tournament win probabilities.
+
+The cleaned workflow improves reproducibility by using relative paths, separates feature selection from test data, evaluates the model on future seasons, calculates classification metrics programmatically, and isolates the Kelly Criterion from unsupported claims about real-world sportsbook performance.
+
+The next extension is to integrate verified historical betting odds and evaluate whether model-implied edges remain profitable after sportsbook vig and realistic bankroll constraints.
